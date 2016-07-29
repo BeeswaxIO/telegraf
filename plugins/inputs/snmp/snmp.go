@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
 
 	"github.com/soniah/gosnmp"
@@ -16,7 +18,7 @@ import (
 
 const description = `Retrieves SNMP values from remote agents`
 const sampleConfig = `
-  agents = [ "127.0.0.1:161" ]
+  agents = ["127.0.0.1:161"]
   version = 2 # Values: 1, 2, or 3
 
   ## SNMPv1 & SNMPv2 parameters
@@ -49,7 +51,7 @@ const sampleConfig = `
   [[inputs.snmp.table]]
     # measurement name
     name = "remote_servers"
-    inherit_tags = [ "hostname" ]
+    inherit_tags = ["hostname"]
     [[inputs.snmp.table.field]]
       name = "server"
       oid = ".1.2.3.0.0.0"
@@ -102,6 +104,8 @@ type Snmp struct {
 	Fields []Field `toml:"field"`
 
 	connectionCache map[string]snmpConnection
+
+	inited bool
 }
 
 // Table holds the configuration for a SNMP table.
@@ -189,15 +193,6 @@ func Errorf(err error, msg string, format ...interface{}) error {
 	}
 }
 
-func init() {
-	inputs.Add("snmp", func() telegraf.Input {
-		return &Snmp{
-			Retries:        5,
-			MaxRepetitions: 50,
-		}
-	})
-}
-
 // SampleConfig returns the default configuration of the input.
 func (s *Snmp) SampleConfig() string {
 	return sampleConfig
@@ -212,6 +207,10 @@ func (s *Snmp) Description() string {
 // Any error encountered does not halt the process. The errors are accumulated
 // and returned at the end.
 func (s *Snmp) Gather(acc telegraf.Accumulator) error {
+	if !s.inited {
+		s.initOidNames()
+	}
+	s.inited = true
 	var errs Errors
 	for _, agent := range s.Agents {
 		gs, err := s.getConnection(agent)
@@ -242,6 +241,29 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 		return nil
 	}
 	return errs
+}
+
+// initOidNames loops through each [[inputs.snmp.field]] defined.
+// If the field doesn't have a 'name' defined, it will attempt to use
+// snmptranslate to get a name for the OID. If snmptranslate doesn't return a
+// name, or snmptranslate is not available, then use the OID as the name.
+func (s *Snmp) initOidNames() {
+	bin, _ := exec.LookPath("snmptranslate")
+	for i, field := range s.Fields {
+		if field.Name != "" {
+			continue
+		}
+		name := field.Oid
+		if bin != "" {
+			out, err := internal.CombinedOutputTimeout(
+				exec.Command(bin, "-Os", field.Oid),
+				time.Millisecond*250)
+			if err == nil && len(out) > 0 {
+				name = strings.TrimSpace(string(out))
+			}
+		}
+		s.Fields[i].Name = name
+	}
 }
 
 func (s *Snmp) gatherTable(acc telegraf.Accumulator, gs snmpConnection, t Table, topTags map[string]string, walk bool) error {
@@ -621,4 +643,13 @@ func fieldConvert(conv string, v interface{}) interface{} {
 	}
 
 	return v
+}
+
+func init() {
+	inputs.Add("snmp", func() telegraf.Input {
+		return &Snmp{
+			Retries:        5,
+			MaxRepetitions: 50,
+		}
+	})
 }
